@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+
+# Author: Muhammad Ali Qureshi
+# CSC 574 Mini-Project 1
+# dh-proxy: Diffie-Hellman Man-in-the-Middle proxy
+
+# Import additional modules as needed.
+import argparse
+import sys
+import socket
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Random import random
+from Crypto.Hash import SHA256
+from Crypto.Util.Padding import pad,unpad
+
+# Diffie-Hellman Parameters
+g=2
+p=0x00cc81ea8157352a9e9a318aac4e33ffba80fc8da3373fb44895109e4c3ff6cedcc55c02228fccbd551a504feb4346d2aef47053311ceaba95f6c540b967b9409e9f0502e598cfc71327c5a455e2e807bede1e0b7d23fbea054b951ca964eaecae7ba842ba1fc6818c453bf19eb9c5c86e723e69a210d4b72561cab97b3fb3060b
+
+
+# Note: STDIN and STDOUT are not redirected in this program so the use of this print wrapper is optional.
+def print_debug(*objects, sep=' ', end='\n', file=sys.stderr, flush=False):
+    """
+    When stdout is redirected, messages cannot be printed to stdout as they will be written to the file, not the console.
+    Use this function to print debug messages to stderr.
+    It supports all optional arguments of the print function, with the exception that file is overridden to stderr.
+
+    :param objects: Any non-keyword argument that can be converted to string.
+    :param sep: String to separate objects. [Default: Space]
+    :param end: String to append to the end. [Default: Newline]
+    :param file: Not used. Overridden to sys.stderr.
+    :param flush: Forcibly flush the stream.
+    """
+
+    print(objects, sep=sep, end=end, file=sys.stderr, flush=flush)
+
+
+def num_to_x_byte_str(num, numbytes):
+    """
+    Converts int to numbytes-byte string with a bunch of 0s in front of it
+    IMPORTANT: This function should NOT be used when creating the string representation of the output of the
+                diffie-hellman key agreement procedure before hashing it. Use create_final_dh_string instead.
+
+
+    :param num: The number to be encoded.
+    :param numbytes:  The total number of bytes the string should take.
+    :return: decimal representation of num padded with zeros.
+    """
+
+    num = str(num)
+    return (numbytes - len(num)) * '0' + num
+
+
+def create_final_dh_string(new_key):
+    """
+    Process the output of the diffie_hellman key into a hex string for use in generating the session key.
+    IMPORTANT: This function should NOT be used when creating the string representation of A and B.
+               Use num_to_x_byte_str instead.
+
+    :param new_key: Diffie-Hellman Key
+    :return: Hex string representation of new_key.
+    """
+
+    # Post-process the created key
+    new_key_str = '%x' % new_key
+
+    return new_key_str.encode('utf-8')
+
+
+def proxy(server_port, client_ip_address, client_port):
+    """
+    Proxy Code
+
+    :param server_port: Port number for server component of dh-proxy to listen on.
+    :param client_ip_address: Address for client component of dh-proxy to connect to.
+    :param client_port: Port number for client component of dh-proxy to connect to.
+    """
+
+    serverProxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    proxy_ip = '127.0.0.1'
+    serverProxy.bind((proxy_ip ,int(server_port)))
+    serverProxy.listen(1)
+
+    clientProxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    clientProxy.connect((client_ip_address,int(client_port)))
+
+    (cSocketProxy, address) = serverProxy.accept()
+
+    A = int.from_bytes(cSocketProxy.recv(384),'big')
+    c = random.randint(1,pow(2,384))
+    C = pow(g,c,p)
+    C = int(num_to_x_byte_str(C,384))
+
+    cSocketProxy.send(C.to_bytes(384,'big'))
+
+    password = pow(A,c,p)
+    dh_string = create_final_dh_string(password)
+    hash_dh_string = SHA256.new(dh_string)
+    key = hash_dh_string.digest()[:32]
+
+    broken = False
+    og_data = []
+    while True:
+        header = cSocketProxy.recv(2)
+        if header == b'':
+            break
+        datalength = int.from_bytes(header,'big')
+        init_vector = cSocketProxy.recv(16)
+        tag = cSocketProxy.recv(16)
+        ciphertext = cSocketProxy.recv(datalength-32)
+        cipher = AES.new(key, AES.MODE_GCM, init_vector)
+        try:
+            data = cipher.decrypt_and_verify(ciphertext, tag)
+            sys.stdout.buffer.write(unpad(data,block_size=16,style='pkcs7'))
+            og_data.append(unpad(data,block_size=16,style='pkcs7'))
+        except :
+            print_debug('Error: integrity check failed.')
+            broken = True
+            break
+    
+    clientProxy.send(C.to_bytes(384,'big'))
+    B = int.from_bytes(clientProxy.recv(384),'big')
+    password = pow(B,c,p)
+    dh_string = create_final_dh_string(password)
+    hash_dh_string = SHA256.new(dh_string)
+    key = hash_dh_string.digest()[:32]
+
+    data = b''.join(og_data)
+    datalength = len(data)
+    for i in range(0,datalength,1024):
+        cipher = AES.new(key,AES.MODE_GCM)
+        datablock = data[i:min(i+1024,datalength)]
+        init_vector = cipher.nonce
+        ciphertext, tag = cipher.encrypt_and_digest(pad(datablock,block_size=16,style='pkcs7'))
+        blocklength = len(ciphertext) + 32
+        datablock = blocklength.to_bytes(2,'big') + init_vector + tag + ciphertext
+        clientProxy.send(datablock)
+
+    if not broken:
+        print_debug('File Transferred') 
+
+def parse_args():
+    """
+    Command Line Argument Parser
+
+    :return: Argparse Namespace of identified command line arguments.
+    """
+    # Configure the argument parser.
+    parser = argparse.ArgumentParser(description='Diffie-Hellman Proxy')
+    listen_group = parser.add_argument_group('listen_group', 'Listen options')
+    listen_group.add_argument('-l', dest='server_port', action='store', help='Listen port')
+    connect_group = parser.add_argument_group('connect_group', 'Connect to options')
+    connect_group.add_argument('client_ip_address', nargs='?')
+    connect_group.add_argument('client_port', nargs='?')
+
+    # Parse arguments.
+    args = parser.parse_args()
+
+    # Check if arguments are valid.
+    args_ok = (args.server_port is not None and args.client_ip_address is not None and args.client_port is not None)
+
+    # If not, show usage message and exit.
+    if not args_ok:
+        print("./dh-proxy -l SERVER_PORT CLIENT_IP_ADDRESS CLIENT_PORT")
+        sys.exit(0)
+
+    # Otherwise return the args.
+    return args
+
+
+def main():
+    # Parse Arguments
+    args = parse_args()
+
+    # Launch the proxy.
+    if args.server_port is not None:
+        proxy(args.server_port, args.client_ip_address, args.client_port)
+
+
+if __name__ == "__main__":
+    main()
